@@ -10,10 +10,8 @@ I'm not a professional programmer. This project was developed with the help of A
 2. Drag and drop the corrupted channel files into the program.
 3. Select **HRPT** mode.
 4. Adjust the parameters until all dark areas you want to correct are highlighted.
-5. Run the correction. The script will create corrected copies of the input files.
-6. Move or remove the original files if necessary.
-7. Remove the `corrected` prefix from the generated filenames.
-8. Load `product.cbor` into SatDump and process the data as usual.
+5. Run the correction. The script will replace images with the corrected ones. Images without correction will be stored in backup folder.
+6. Load `product.cbor` into SatDump and process the data as usual.
 
 ## Feedback and contributions
 
