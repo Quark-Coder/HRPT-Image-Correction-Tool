@@ -425,7 +425,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.input_paths = []
         self.mode = None
-        self.setWindowTitle("HRPT Reviver v1.0.0")
+        self.setWindowTitle("HRPT Reviver v1.0.1")
         self.resize(1500, 950)
         self.setup_ui()
         self.setAcceptDrops(True)
@@ -444,7 +444,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        title = QLabel("HRPT Reviver v1.0.0")
+        title = QLabel("HRPT Reviver v1.0.1")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("QLabel { font-size: 20px; font-weight: bold; padding: 10px; }")
         layout.addWidget(title)
