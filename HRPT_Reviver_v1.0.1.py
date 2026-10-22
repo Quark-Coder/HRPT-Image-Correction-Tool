@@ -1,10 +1,12 @@
+import os
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF, QSettings
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,13 +27,19 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap, QPainter
 
-# Максимальная сторона превью (реальная обработка идёт по полному размеру)
 PREVIEW_MAX_SIDE = 900
+
+# Settings are stored in AppData (Windows) or ~/.config (Linux/macOS)
+# via Qt's ini format: %APPDATA%/HRPTReviver/HRPTReviver.ini
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+SETTINGS = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+                     "HRPTReviver", "HRPTReviver")
+IN_PLACE_KEY = "save/in_place_overwrite"
 
 
 class PreviewWorker(QThread):
-    """Считает маску дефектных пикселей для превью в фоновом потоке."""
-    preview_ready = pyqtSignal(int, object)  # (поколение, np.ndarray RGB | None)
+    """Computes the defective pixel mask for the preview in a background thread."""
+    preview_ready = pyqtSignal(int, object)  # (generation, np.ndarray RGB | None)
 
     def __init__(self, gen, array, is_hrpt, black_threshold, deviation_threshold,
                  max_band_height=3):
@@ -61,7 +69,6 @@ class PreviewWorker(QThread):
             self.preview_ready.emit(self.gen, None)
             return
 
-        # Затемнённая основа + красная подсветка того, что считается дефектом
         if c == 1:
             rgb = np.repeat(arr, 3, axis=2)
         else:
@@ -72,8 +79,8 @@ class PreviewWorker(QThread):
 
 
 class PreviewCanvas(QGraphicsView):
-    """Полноценный просмотрщик превью с pan (перетаскивание мышью)
-    и zoom (колесо мыши, зум к позиции курсора)."""
+    """Full-featured preview viewer with pan (mouse dragging)
+    and zoom (mouse wheel, zooming toward the cursor position)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -90,7 +97,7 @@ class PreviewCanvas(QGraphicsView):
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
 
         self._fit_mode = True
-        self.zoom_label = None  # устанавливается снаружи
+        self.zoom_label = None  
 
     # ---------- API ----------
     def set_image(self, pixmap):
@@ -109,12 +116,12 @@ class PreviewCanvas(QGraphicsView):
         self._update_zoom_label()
 
     def actual_pixels(self):
-        """Масштаб 1:1 (1 пиксель изображения = 1 пиксель экрана)."""
+        """Zoom 1:1 (1 image pixel = 1 screen pixel)."""
         self._fit_mode = False
         self.resetTransform()
         self._update_zoom_label()
 
-    # ---------- События ----------
+    # ---------- Events ----------
     def wheelEvent(self, event):
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         self.zoom_step(factor)
@@ -127,7 +134,6 @@ class PreviewCanvas(QGraphicsView):
             self._update_zoom_label()
 
     def mouseReleaseEvent(self, event):
-        # Прерываем режим Fit при ручном панорамировании
         self._fit_mode = False
         super().mouseReleaseEvent(event)
 
@@ -151,8 +157,8 @@ class ImageRepair:
 
     @staticmethod
     def load_gray(path):
-        """Загрузка монохромного файла «как есть» (L, I, I;16):
-        битность и режим сохраняются, никакой конвертации."""
+        """Loads a monochrome file "as is" (L, I, I;16):
+        bit depth and mode are preserved, no conversion."""
         img = Image.open(path)
         if len(img.getbands()) != 1:
             raise ValueError(f"not a grayscale image (mode {img.mode})")
@@ -160,12 +166,11 @@ class ImageRepair:
 
     @staticmethod
     def is_gray_mode(mode):
-        # L – 8 бит, I/I;16 – 16-битные монохромные PNG
         return mode in ("L", "I", "I;16")
 
     @staticmethod
     def _ranges_from_mask(mask):
-        """Диапазоны строк, в которых есть дефектные пиксели."""
+        """Row ranges containing defective pixels."""
         rows = np.any(mask, axis=1)
         ranges = []
         start = None
@@ -181,8 +186,8 @@ class ImageRepair:
 
     @staticmethod
     def _rebuild_image(image, arr):
-        """Собирает изображение с ТОЧНО тем же режимом, что у оригинала,
-        перенося его метаданные (info)."""
+        """Rebuilds the image with EXACTLY the same mode as the original,
+        carrying over its metadata (info)."""
         mode = image.mode
         if mode == "L":
             out = Image.fromarray(arr, mode="L")
@@ -208,9 +213,7 @@ class ImageRepair:
         except ValueError:
             return 255.0
 
-    # ------------------------------------------------------------------
-    # LRPT: классический ремонт чёрных полос
-    # ------------------------------------------------------------------
+
     @staticmethod
     def repair_channel(channel, black_threshold=5):
         height, width = channel.shape
@@ -258,10 +261,10 @@ class ImageRepair:
 
     @classmethod
     def repair(cls, image, black_threshold=5):
-        """Ремонт чёрных полос. Битность и режим изображения сохраняются
-        (L, I, I;16, RGB, RGBA): у RGBA обрабатываются только цветовые
-        каналы, альфа остаётся нетронутой. Порог задаётся в единицах 0-255
-        и масштабируется под битность автоматически."""
+        """Black band repair. Bit depth and image mode are preserved
+        (L, I, I;16, RGB, RGBA): for RGBA only the color channels are
+        processed, alpha is left untouched. The threshold is given in
+        0-255 units and scaled to the bit depth automatically."""
         array = np.array(image)
         scale = cls._dtype_max(array.dtype) / 255.0
         thr = black_threshold * scale
@@ -276,7 +279,6 @@ class ImageRepair:
             out_arr = repaired
         else:
             out_arr = array.copy()
-            # Цветовые каналы; у RGBA альфа (последний канал) не трогается
             for ch in range(min(3, array.shape[2])):
                 repaired_ch = cls.repair_channel(array[:, :, ch], thr)
                 mask = repaired_ch != array[:, :, ch]
@@ -287,16 +289,13 @@ class ImageRepair:
 
         return cls._rebuild_image(image, out_arr), all_ranges
 
-    # ------------------------------------------------------------------
-    # HRPT: детектор двусторонних выбросов (тонкие тёмные И яркие полосы,
-    # а также мелкие цветовые артефакты), векторизовано через numpy
-    # ------------------------------------------------------------------
+
     @staticmethod
     def _vertical_interp(values, good):
-        """Линейная интерполяция по вертикали между ближайшими «хорошими»
-        пикселями строго сверху и строго снизу (сам пиксель соседом не
-        считается). Если good-пиксели есть только с одной стороны —
-        репликация крайнего значения. Возвращает (interp, valid)."""
+        """Linear vertical interpolation between the nearest "good"
+        pixels strictly above and strictly below (the pixel itself is not
+        counted as a neighbor). If good pixels exist only on one side —
+        edge value replication. Returns (interp, valid)."""
         h, w = values.shape
         up_val = np.full((h, w), np.nan, dtype=np.float32)
         dn_val = np.full((h, w), np.nan, dtype=np.float32)
@@ -327,27 +326,24 @@ class ImageRepair:
         with np.errstate(invalid='ignore', divide='ignore'):
             t = np.where(total > 0, up_dist / total, 0.5)
         interp = (1.0 - t) * up_val + t * dn_val
-        # Репликация: если good есть только с одной стороны
         interp = np.where(np.isnan(up_val), dn_val,
                           np.where(np.isnan(dn_val), up_val, interp))
         return interp, valid
 
     @staticmethod
     def _vertical_median(c, half=3):
-        """Вертикальный медианный фильтр с окном 2*half+1 (заполнение краёв
-        репликацией). Полоса толщиной до half пикселей – меньшинство в окне,
-        поэтому медиана задаёт «фон» сцены, свободный от полос."""
+        """Vertical median filter with a window of 2*half+1 (edges filled
+        by replication). A band up to half pixels thick is a minority in the
+        window, so the median defines the band-free "background" of the scene."""
         h, w = c.shape
-        # reflect, а не edge: иначе дефектная крайняя строка реплицируется
-        # в окно и сама становится «фоном»
         pad = np.pad(c, ((half, half), (0, 0)), mode='reflect')
         stack = np.stack([pad[y:y + h] for y in range(2 * half + 1)])
         return np.median(stack, axis=0)
 
     @staticmethod
     def _drop_tall_runs(mask, max_band_height):
-        """Убирает из маски вертикальные пробеги длиннее max_band_height:
-        дефект – тонкая полоса, крупные связные зоны относятся к сцене."""
+        """Removes vertical runs longer than max_band_height from the mask:
+        a defect is a thin band; large connected areas belong to the scene."""
         h, w = mask.shape
         if max_band_height >= h:
             return mask
@@ -361,26 +357,20 @@ class ImageRepair:
     @classmethod
     def repair_channel_hrpt(cls, channel, deviation_threshold=30, grow_iterations=4,
                             max_band_height=3):
-        """Пиксель дефектный, если он резко (более чем на deviation_threshold)
-        отклоняется от интерполяции соседних строк — в любую сторону.
-        Первая проходка находит явные одиночные выбросы (соседи сверху и снизу
-        при этом «согласованы» между собой), затем маска итеративно
-        расширяется, чтобы захватить полосы толщиной 2-3+ пикселя.
-        Пробеги дефектных пикселей выше max_band_height отбрасываются —
-        так крупные тёмные/яркие участки сцены не попадают в ремонт."""
+        """A pixel is defective if it deviates sharply (by more than
+        deviation_threshold) from the interpolation of the neighboring rows —
+        in either direction. The first pass finds obvious single outliers
+        (with the neighbors above and below "agreeing" with each other),
+        then the mask is iteratively expanded to catch bands 2-3+ pixels
+        thick. Runs of defective pixels taller than max_band_height are
+        discarded — this keeps large dark/bright scene areas out of repair."""
         orig = channel
         c = channel.astype(np.float32)
         h, w = channel.shape
 
-        # Фон = вертикальная медиана (окно 7). Тонкая полоса (1-3 px) в ней
-        # – меньшинство и на медиану не влияет, поэтому отклонение от фона
-        # ловит и тёмные, и яркие полосы, а границы крупных зон не трогает.
         bg = cls._vertical_median(c, half=3)
         defect = np.abs(c - bg) > deviation_threshold
 
-        # Итеративное расширение: только пиксели, соседние по вертикали
-        # с уже найденными дефектами, проверяются относительно интерполяции
-        # ближайших заведомо хороших пикселей (захват более редких толстых полос)
         for _ in range(grow_iterations):
             adj = defect | np.vstack([defect[0:1], defect[:-1]]) | \
                 np.vstack([defect[1:], defect[-1:]])
@@ -391,7 +381,6 @@ class ImageRepair:
                 break
             defect |= grow
 
-        # Отбрасываем крупные связные зоны – оставляем только тонкие полосы
         defect = cls._drop_tall_runs(defect, max_band_height)
 
         interp, valid = cls._vertical_interp(c, ~defect)
@@ -402,10 +391,10 @@ class ImageRepair:
 
     @classmethod
     def repair_hrpt(cls, image, deviation_threshold=30, max_band_height=3):
-        """Ремонт тонких полос/выбросов. Битность и режим изображения
-        сохраняются (L, I, I;16, RGB, RGBA): у RGBA обрабатываются только
-        цветовые каналы, альфа остаётся нетронутой. Порог задаётся в
-        единицах 0-255 и масштабируется под битность автоматически."""
+        """Thin band/outlier repair. Bit depth and image mode are
+        preserved (L, I, I;16, RGB, RGBA): for RGBA only the color channels
+        are processed, alpha is left untouched. The threshold is given in
+        0-255 units and scaled to the bit depth automatically."""
         array = np.array(image)
         scale = cls._dtype_max(array.dtype) / 255.0
         thr = deviation_threshold * scale
@@ -420,7 +409,6 @@ class ImageRepair:
             out_arr = repaired
         else:
             out_arr = array.copy()
-            # Цветовые каналы; у RGBA альфа (последний канал) не трогается
             for ch in range(min(3, array.shape[2])):
                 repaired_ch, defect = cls.repair_channel_hrpt(
                     array[:, :, ch], thr, max_band_height=max_band_height)
@@ -437,7 +425,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.input_paths = []
         self.mode = None
-        self.setWindowTitle("Black Band Repair v2 (LRPT / HRPT)")
+        self.setWindowTitle("HRPT Reviver v1.0.0")
         self.resize(1500, 950)
         self.setup_ui()
         self.setAcceptDrops(True)
@@ -447,18 +435,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
 
-        # Левая панель – все настройки и отчёты
         panel = QWidget()
         panel.setFixedWidth(380)
         main_layout.addWidget(panel)
 
-        # Правая часть – полноформатное превью с pan/zoom
         main_layout.addWidget(self.setup_preview_widget(), stretch=1)
 
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        title = QLabel("Black Band Repair v2")
+        title = QLabel("HRPT Reviver v1.0.0")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("QLabel { font-size: 20px; font-weight: bold; padding: 10px; }")
         layout.addWidget(title)
@@ -469,7 +455,8 @@ class MainWindow(QMainWindow):
             "HRPT mode: detects thin dark AND bright bands plus small color artifacts "
             "(spike detector, column-wise interpolation).\n\n"
             "Drag & drop one RGB image or three grayscale images (R, G, B channels).\n"
-            "Originals are kept untouched; results are saved as *_corrected.* copies."
+            "By default originals are backed up to './backup' and repaired in place;\n"
+            "disable the overwrite option to save *_corrected.* copies instead."
         )
         description.setWordWrap(True)
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -484,7 +471,6 @@ class MainWindow(QMainWindow):
         self.file_label.setStyleSheet("QLabel { padding: 5px; }")
         layout.addWidget(self.file_label)
 
-        # ---------- Выбор режима ----------
         mode_label = QLabel("Signal Mode")
         mode_label.setStyleSheet("QLabel { font-size: 15px; font-weight: bold; padding-top: 10px; }")
         layout.addWidget(mode_label)
@@ -499,11 +485,21 @@ class MainWindow(QMainWindow):
         mode_layout.addWidget(self.hrpt_checkbox)
         layout.addLayout(mode_layout)
 
+        self.inplace_checkbox = QCheckBox(
+            "Overwrite originals (backup to ./backup)")
+        self.inplace_checkbox.setChecked(
+            SETTINGS.value(IN_PLACE_KEY, True, type=bool))
+        self.inplace_checkbox.setToolTip(
+            "ON: original files are copied to a 'backup' folder next to them,\n"
+            "then repaired in place (file names unchanged).\n"
+            "OFF: results are saved as *_corrected.* copies next to the originals.")
+        self.inplace_checkbox.toggled.connect(self.on_inplace_changed)
+        layout.addWidget(self.inplace_checkbox)
+
         settings_label = QLabel("Detection Settings")
         settings_label.setStyleSheet("QLabel { font-size: 15px; font-weight: bold; padding-top: 10px; }")
         layout.addWidget(settings_label)
 
-        # Порог для LRPT
         threshold_layout = QHBoxLayout()
         threshold_name = QLabel("Black threshold:")
         self.threshold = QSpinBox()
@@ -515,7 +511,6 @@ class MainWindow(QMainWindow):
         threshold_layout.addWidget(self.threshold)
         layout.addLayout(threshold_layout)
 
-        # Ограничение высоты полосы для LRPT
         bandh_layout = QHBoxLayout()
         bandh_name = QLabel("Max band height:")
         self.max_band_height = QSpinBox()
@@ -530,7 +525,7 @@ class MainWindow(QMainWindow):
         bandh_layout.addWidget(self.max_band_height)
         layout.addLayout(bandh_layout)
 
-        # Порог для HRPT
+        # Threshold for HRPT
         deviation_layout = QHBoxLayout()
         deviation_name = QLabel("Deviation threshold:")
         self.deviation = QSpinBox()
@@ -569,21 +564,19 @@ class MainWindow(QMainWindow):
         self.bands_text.setPlaceholderText("List of row ranges where changes were applied will appear here.")
         layout.addWidget(self.bands_text)
 
-        # ---------- Превью (в правой части окна) ----------
-        # Таймер дебаунса: превью пересчитывается не чаще, чем раз в 300 мс
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.setInterval(300)
         self.preview_timer.timeout.connect(self.update_preview)
 
-        self.preview_gen = 0          # поколение запроса (защита от устаревших результатов)
-        self.preview_array = None     # уменьшенная копия загруженного изображения
+        self.preview_gen = 0          
+        self.preview_array = None    
         self.preview_worker = None
 
         self.on_mode_changed()
 
     def setup_preview_widget(self):
-        """Правая часть окна: полноформатный просмотрщик с pan/zoom."""
+        """Right side of the window: full-size viewer with pan/zoom."""
         container = QWidget()
         v = QVBoxLayout(container)
         v.setContentsMargins(0, 12, 12, 12)
@@ -627,9 +620,9 @@ class MainWindow(QMainWindow):
         v.addWidget(self.canvas, stretch=1)
         return container
     def build_preview_array(self):
-        """Уменьшенная копия загруженного изображения для превью.
-        NEAREST – чтобы тонкие полосы не размывались при уменьшении.
-        Для превью приводится к 8 битам (обработка идёт нативно)."""
+        """Downscaled copy of the loaded image for the preview.
+        NEAREST — so thin bands don't get blurred when downscaling.
+        The preview is converted to 8 bits (processing runs natively)."""
         if not self.input_paths:
             self.preview_array = None
             return
@@ -679,7 +672,6 @@ class MainWindow(QMainWindow):
         self.preview_worker.start()
 
     def on_preview_ready(self, gen, frame):
-        # Результат устаревшего запроса игнорируем
         if gen != self.preview_gen or frame is None:
             return
         h, w, _ = frame.shape
@@ -687,8 +679,10 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(QPixmap.fromImage(image))
         self.status.setText("Ready to process")
 
+    def on_inplace_changed(self, checked):
+        SETTINGS.setValue(IN_PLACE_KEY, bool(checked))
+
     def on_mode_changed(self):
-        # Режимы взаимоисключающие
         sender = self.sender()
         if sender is self.lrpt_checkbox and self.lrpt_checkbox.isChecked():
             self.hrpt_checkbox.blockSignals(True)
@@ -706,9 +700,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'preview_timer'):
             self.schedule_preview_update()
 
-    # ---------- Drag & Drop ----------
     def closeEvent(self, event):
-        # Аккуратно останавливаем фоновый поток превью при закрытии
         if self.preview_worker is not None and self.preview_worker.isRunning():
             self.preview_worker.wait(2000)
         super().closeEvent(event)
@@ -728,7 +720,6 @@ class MainWindow(QMainWindow):
             return
         self.load_paths(paths)
 
-    # ---------- Загрузка файлов ----------
     def open_images(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -777,7 +768,6 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Cannot open {p.name}:\n{e}")
                     return
-            # Проверяем размеры
             sizes = [Image.open(p).size for p in grayscale_paths]
             if not all(s == sizes[0] for s in sizes):
                 QMessageBox.warning(
@@ -808,11 +798,9 @@ class MainWindow(QMainWindow):
         self.process_button.setEnabled(True)
         self.status.setText("Ready to process")
 
-        # Строим превью для загруженных файлов
         self.build_preview_array()
         self.schedule_preview_update()
 
-    # ---------- Обработка ----------
     def process_image(self):
         if not self.input_paths:
             return
@@ -823,12 +811,26 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
             def corrected_path(p):
-                # Результат сохраняется рядом с оригиналом с приставкой _corrected
                 return p.with_name(f"{p.stem}_corrected{p.suffix}")
 
+            in_place = self.inplace_checkbox.isChecked()
+
+            def target_path(p):
+                """Returns the output path for the source file p. In the
+                in-place mode the original is first copied to the 'backup'
+                folder next to it, and the file itself is overwritten."""
+                if not in_place:
+                    return corrected_path(p)
+                backup_dir = p.parent / "backup"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backup_dir / p.name
+                if not backup_path.exists():
+                    shutil.copy2(p, backup_path)
+                return p
+
             def save_like(repaired_img, original_img, out_path):
-                """Сохраняет результат с метаданными оригинала (dpi, exif),
-                чтобы параметры файлов совпадали."""
+                """Saves the result with the original's metadata (dpi, exif)
+                so the file parameters match."""
                 kwargs = {}
                 info = getattr(original_img, 'info', {})
                 if 'dpi' in info:
@@ -844,40 +846,34 @@ class MainWindow(QMainWindow):
             is_hrpt = self.hrpt_checkbox.isChecked()
 
             def do_repair(img):
-                # Выбор алгоритма в зависимости от режима
                 if is_hrpt:
                     return ImageRepair.repair_hrpt(img, deviation_threshold=deviation,
                                                    max_band_height=max_band_height)
                 return ImageRepair.repair(img, black_threshold=threshold)
 
-            # Обрабатываем в зависимости от режима
             if self.mode == 'single_rgb':
-                # Одиночное изображение (RGB/RGBA, режим и битность сохраняются)
+
                 img = ImageRepair.load_image(self.input_paths[0])
                 repaired, ranges = do_repair(img)
-                # Сохраняем в копию, оригинал не трогаем
-                out_path = corrected_path(self.input_paths[0])
+                out_path = target_path(self.input_paths[0])
                 save_like(repaired, img, out_path)
                 all_results = [{'file': out_path.name, 'ranges': ranges}]
                 self.progress.setValue(90)
 
             elif self.mode == 'single_gray':
-                # Одиночное монохромное (в т.ч. 16-битное), нативно
                 img = ImageRepair.load_gray(self.input_paths[0])
                 repaired, ranges = do_repair(img)
-                out_path = corrected_path(self.input_paths[0])
+                out_path = target_path(self.input_paths[0])
                 save_like(repaired, img, out_path)
                 all_results = [{'file': out_path.name, 'ranges': ranges}]
                 self.progress.setValue(90)
 
             elif self.mode == 'three_gray':
-                # Три монохромных файла: каждый обрабатывается нативно,
-                # битность и метаданные каждого сохраняются
                 all_results = []
                 for ch, p in enumerate(self.input_paths):
                     img = ImageRepair.load_gray(p)
                     repaired, ranges = do_repair(img)
-                    out_path = corrected_path(p)
+                    out_path = target_path(p)
                     save_like(repaired, img, out_path)
                     if ranges:
                         all_results.append({'file': out_path.name,
@@ -888,7 +884,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", "Unknown mode.")
                 return
 
-            # Отображение результатов
             self.bands_text.clear()
             if all_results:
                 lines = []
@@ -897,7 +892,6 @@ class MainWindow(QMainWindow):
                     for info in res['ranges']:
                         ch_name = 'Grayscale' if self.mode in ('single_gray',) else ['R', 'G', 'B'][info['channel']]
                         lines.append(f"  Channel {ch_name}:")
-                        # В HRPT-режиме полос очень много – группируем вывод
                         if is_hrpt and len(info['ranges']) > 50:
                             total_rows = sum(end - start + 1 for start, end in info['ranges'])
                             lines.append(
@@ -916,12 +910,15 @@ class MainWindow(QMainWindow):
                 self.status.setText("Done")
                 total = sum(len(info['ranges']) for res in all_results for info in res['ranges'])
                 mode_name = "HRPT" if is_hrpt else "LRPT"
+                save_note = ("Originals backed up to './backup' and repaired in place."
+                             if in_place else
+                             "Corrected copies saved as *_corrected.* next to the originals.")
                 QMessageBox.information(
                     self,
                     "Complete",
                     f"Processed {len(self.input_paths)} file(s) in {mode_name} mode.\n"
                     f"Total bands repaired: {total}\n\n"
-                    f"Corrected copies saved as *_corrected.* next to the originals."
+                    f"{save_note}"
                 )
             else:
                 self.bands_text.setPlainText("No black bands detected in any file.")
