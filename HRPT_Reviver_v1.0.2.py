@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QWidget,
     QProgressBar,
     QPlainTextEdit,
+    QListWidget,
+    QListWidgetItem,
     QGraphicsView,
     QGraphicsScene,
     QGraphicsPixmapItem,
@@ -28,6 +30,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap, QPainter
 
 PREVIEW_MAX_SIDE = 900
+
+APP_NAME="HRPT Reviver v1.0.2"
 
 # Settings are stored in AppData (Windows) or ~/.config (Linux/macOS)
 # via Qt's ini format: %APPDATA%/HRPTReviver/HRPTReviver.ini
@@ -39,7 +43,7 @@ IN_PLACE_KEY = "save/in_place_overwrite"
 
 class PreviewWorker(QThread):
     """Computes the defective pixel mask for the preview in a background thread."""
-    preview_ready = pyqtSignal(int, object)  # (generation, np.ndarray RGB | None)
+    preview_ready = pyqtSignal(int, object, object)  # (generation, rgb, mask)
 
     def __init__(self, gen, array, is_hrpt, black_threshold, deviation_threshold,
                  max_band_height=3):
@@ -66,16 +70,15 @@ class PreviewWorker(QThread):
                 for ch in range(c):
                     mask |= arr[:, :, ch] <= self.black_threshold
         except Exception:
-            self.preview_ready.emit(self.gen, None)
+            self.preview_ready.emit(self.gen, None, None)
             return
 
         if c == 1:
             rgb = np.repeat(arr, 3, axis=2)
         else:
             rgb = arr[:, :, :3]
-        base = (rgb.astype(np.float32) * 0.4).astype(np.uint8)
-        base[mask] = [255, 60, 60]
-        self.preview_ready.emit(self.gen, base)
+        rgb = rgb.astype(np.uint8)
+        self.preview_ready.emit(self.gen, rgb, mask)
 
 
 class PreviewCanvas(QGraphicsView):
@@ -97,14 +100,41 @@ class PreviewCanvas(QGraphicsView):
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
 
         self._fit_mode = True
-        self.zoom_label = None  
+        self.zoom_label = None
+        self._overlay_pixmap = None
+        self._original_pixmap = None
+        self._showing_original = False
 
     # ---------- API ----------
+    def set_images(self, original_pixmap, overlay_pixmap):
+        """original_pixmap — изображение без разметки, overlay_pixmap —
+        с красной отметкой дефектов. Удержание ЛКМ временно показывает
+        оригинал, чтобы видеть, что именно удаляется."""
+        self._original_pixmap = original_pixmap
+        self._overlay_pixmap = overlay_pixmap
+        self._showing_original = False
+        self._pixmap_item.setPixmap(overlay_pixmap)
+        self._scene.setSceneRect(QRectF(self._pixmap_item.boundingRect()))
+        if self._fit_mode:
+            self.fit()
+
     def set_image(self, pixmap):
+        self._overlay_pixmap = pixmap
+        self._original_pixmap = pixmap
+        self._showing_original = False
         self._pixmap_item.setPixmap(pixmap)
         self._scene.setSceneRect(QRectF(self._pixmap_item.boundingRect()))
         if self._fit_mode:
             self.fit()
+
+    def _toggle_original(self, show_original):
+        if self._showing_original == show_original:
+            return
+        pixmap = self._original_pixmap if show_original else self._overlay_pixmap
+        if pixmap is None:
+            return
+        self._showing_original = show_original
+        self._pixmap_item.setPixmap(pixmap)
 
     def fit(self):
         self._fit_mode = True
@@ -133,7 +163,14 @@ class PreviewCanvas(QGraphicsView):
             self.scale(factor, factor)
             self._update_zoom_label()
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._toggle_original(True)
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._toggle_original(False)
         self._fit_mode = False
         super().mouseReleaseEvent(event)
 
@@ -425,7 +462,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.input_paths = []
         self.mode = None
-        self.setWindowTitle("HRPT Reviver v1.0.1")
+        self.setWindowTitle(APP_NAME)
         self.resize(1500, 950)
         self.setup_ui()
         self.setAcceptDrops(True)
@@ -444,32 +481,31 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        title = QLabel("HRPT Reviver v1.0.1")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("QLabel { font-size: 20px; font-weight: bold; padding: 10px; }")
-        layout.addWidget(title)
-
-        description = QLabel(
-            "LRPT mode: detects and repairs black horizontal bands in each channel (R, G, B) "
-            "using column-wise interpolation.\n"
-            "HRPT mode: detects thin dark AND bright bands plus small color artifacts "
-            "(spike detector, column-wise interpolation).\n\n"
-            "Drag & drop one RGB image or three grayscale images (R, G, B channels).\n"
-            "By default originals are backed up to './backup' and repaired in place;\n"
-            "disable the overwrite option to save *_corrected.* copies instead."
-        )
-        description.setWordWrap(True)
-        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(description)
+        help_button = QPushButton("Help")
+        help_button.clicked.connect(self.show_help)
+        layout.addWidget(help_button)
 
         self.open_button = QPushButton("Open Image(s)")
         self.open_button.clicked.connect(self.open_images)
         layout.addWidget(self.open_button)
 
-        self.file_label = QLabel("No file(s) selected")
-        self.file_label.setWordWrap(True)
-        self.file_label.setStyleSheet("QLabel { padding: 5px; }")
-        layout.addWidget(self.file_label)
+        files_label = QLabel("Selected files (click to edit its detection settings):")
+        files_label.setStyleSheet("QLabel { padding-top: 5px; }")
+        layout.addWidget(files_label)
+
+        self.file_list = QListWidget()
+        self.file_list.setMaximumHeight(140)
+        self.file_list.itemSelectionChanged.connect(self.on_file_selection_changed)
+        layout.addWidget(self.file_list)
+
+        self.apply_all_button = QPushButton("Apply current settings to ALL files")
+        self.apply_all_button.setToolTip(
+            "Copies the current detection settings to every file in the list.")
+        self.apply_all_button.clicked.connect(self.apply_settings_to_all)
+        layout.addWidget(self.apply_all_button)
+
+        # Per-image detection settings: {Path: {'threshold':, 'deviation':, 'max_band_height':}}
+        self.per_image = {}
 
         mode_label = QLabel("Signal Mode")
         mode_label.setStyleSheet("QLabel { font-size: 15px; font-weight: bold; padding-top: 10px; }")
@@ -506,7 +542,7 @@ class MainWindow(QMainWindow):
         self.threshold.setRange(0, 100)
         self.threshold.setValue(5)
         self.threshold.setToolTip("Maximum pixel value (0-255) considered black.")
-        self.threshold.valueChanged.connect(self.schedule_preview_update)
+        self.threshold.valueChanged.connect(self.on_setting_changed)
         threshold_layout.addWidget(threshold_name)
         threshold_layout.addWidget(self.threshold)
         layout.addLayout(threshold_layout)
@@ -520,7 +556,7 @@ class MainWindow(QMainWindow):
             "Only defective runs up to this height are treated as bands.\n"
             "Larger connected areas belong to the scene and are left untouched."
         )
-        self.max_band_height.valueChanged.connect(self.schedule_preview_update)
+        self.max_band_height.valueChanged.connect(self.on_setting_changed)
         bandh_layout.addWidget(bandh_name)
         bandh_layout.addWidget(self.max_band_height)
         layout.addLayout(bandh_layout)
@@ -535,7 +571,7 @@ class MainWindow(QMainWindow):
             "Pixel is defective if it deviates from the vertical interpolation\n"
             "of neighboring rows by more than this value (either darker or brighter)."
         )
-        self.deviation.valueChanged.connect(self.schedule_preview_update)
+        self.deviation.valueChanged.connect(self.on_setting_changed)
         deviation_layout.addWidget(deviation_name)
         deviation_layout.addWidget(self.deviation)
         layout.addLayout(deviation_layout)
@@ -590,7 +626,7 @@ class MainWindow(QMainWindow):
         self.canvas.zoom_label = self.zoom_label
 
         toolbar = QHBoxLayout()
-        hint = QLabel("Wheel = zoom, drag = pan")
+        hint = QLabel("Wheel = zoom, drag = pan, hold LMK = no sel. preview")
         hint.setStyleSheet("QLabel { color: #808080; }")
         toolbar.addWidget(hint)
         toolbar.addStretch()
@@ -620,18 +656,19 @@ class MainWindow(QMainWindow):
         v.addWidget(self.canvas, stretch=1)
         return container
     def build_preview_array(self):
-        """Downscaled copy of the loaded image for the preview.
+        """Downscaled copy of the currently selected image for the preview.
         NEAREST — so thin bands don't get blurred when downscaling.
         The preview is converted to 8 bits (processing runs natively)."""
-        if not self.input_paths:
+        path = self.current_path()
+        if path is None:
             self.preview_array = None
             return
         try:
-            if self.mode == 'three_gray':
-                imgs = [ImageRepair.load_gray(p) for p in self.input_paths]
-            else:
-                imgs = [ImageRepair.load_image(self.input_paths[0])]
-            arr = np.array(imgs[0])
+            try:
+                img = ImageRepair.load_gray(path)
+            except ValueError:
+                img = ImageRepair.load_image(path)
+            arr = np.array(img)
             scale = ImageRepair._dtype_max(arr.dtype) / 255.0
             if scale != 1.0:
                 arr = (arr.astype(np.float64) / scale).round().clip(0, 255).astype(np.uint8)
@@ -671,16 +708,77 @@ class MainWindow(QMainWindow):
         self.preview_worker.preview_ready.connect(self.on_preview_ready)
         self.preview_worker.start()
 
-    def on_preview_ready(self, gen, frame):
-        if gen != self.preview_gen or frame is None:
+    def on_preview_ready(self, gen, rgb, mask):
+        if gen != self.preview_gen or rgb is None or mask is None:
             return
-        h, w, _ = frame.shape
-        image = QImage(frame.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-        self.canvas.set_image(QPixmap.fromImage(image))
+        h, w, _ = rgb.shape
+        overlay = rgb.copy()
+        overlay[mask] = [255, 60, 60]
+        original_img = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+        overlay_img = QImage(overlay.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+        self.canvas.set_images(QPixmap.fromImage(original_img),
+                               QPixmap.fromImage(overlay_img))
         self.status.setText("Ready to process")
 
     def on_inplace_changed(self, checked):
         SETTINGS.setValue(IN_PLACE_KEY, bool(checked))
+
+    # ---------- Per-image settings ----------
+    def current_path(self):
+        item = self.file_list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def get_settings(self, path):
+        """Detection settings for a file; falls back to current UI values."""
+        s = self.per_image.get(path)
+        if s is None:
+            s = {'threshold': self.threshold.value(),
+                 'deviation': self.deviation.value(),
+                 'max_band_height': self.max_band_height.value()}
+            self.per_image[path] = s
+        return s
+
+    def on_setting_changed(self):
+        path = self.current_path()
+        if path is not None:
+            self.per_image[path] = {
+                'threshold': self.threshold.value(),
+                'deviation': self.deviation.value(),
+                'max_band_height': self.max_band_height.value(),
+            }
+        self.schedule_preview_update()
+
+    def load_settings_into_ui(self, path):
+        s = self.get_settings(path)
+        for spin, key in ((self.threshold, 'threshold'),
+                          (self.deviation, 'deviation'),
+                          (self.max_band_height, 'max_band_height')):
+            spin.blockSignals(True)
+            spin.setValue(s[key])
+            spin.blockSignals(False)
+        self.schedule_preview_update()
+
+    def on_file_selection_changed(self):
+        path = self.current_path()
+        if path is None or path not in self.per_image:
+            return
+        self.load_settings_into_ui(path)
+        self.build_preview_array()
+        self.schedule_preview_update()
+
+    def apply_settings_to_all(self):
+        """Copies the settings of the currently selected file to all files."""
+        path = self.current_path()
+        if path is None:
+            return
+        s = self.get_settings(path)
+        for p in self.input_paths:
+            self.per_image[p] = dict(s)
+        self.status.setText(
+            f"Settings applied to all {len(self.input_paths)} file(s)")
+        self.schedule_preview_update()
 
     def on_mode_changed(self):
         sender = self.sender()
@@ -720,6 +818,20 @@ class MainWindow(QMainWindow):
             return
         self.load_paths(paths)
 
+    def show_help(self):
+        QMessageBox.information(
+            self,
+            "HRPT Reviver — Help",
+            "LRPT mode: detects and repairs black horizontal bands in each "
+            "channel (R, G, B) using column-wise interpolation.\n"
+            "HRPT mode: detects thin dark AND bright bands plus small color "
+            "artifacts (spike detector, column-wise interpolation).\n\n"
+            "Drag & drop one RGB image or any number of grayscale images (2+),\n"
+            "each grayscale file is processed independently.\n"
+            "By default originals are backed up to './backup' and repaired in place;\n"
+            "disable the overwrite option to save *_corrected.* copies instead."
+        )
+
     def open_images(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -738,12 +850,9 @@ class MainWindow(QMainWindow):
                 if img.mode in ("RGB", "RGBA"):
                     self.mode = 'single_rgb'
                     self.input_paths = [paths[0]]
-                    self.file_label.setText(f"RGB image:\n{paths[0]}")
                 elif ImageRepair.is_gray_mode(img.mode):
                     self.mode = 'single_gray'
                     self.input_paths = [paths[0]]
-                    bitness = "16-bit " if img.mode != "L" else ""
-                    self.file_label.setText(f"{bitness}Grayscale image:\n{paths[0]}")
                 else:
                     QMessageBox.warning(self, "Unsupported", f"Unsupported image mode: {img.mode}")
                     return
@@ -751,7 +860,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Cannot open image:\n{e}")
                 return
 
-        elif len(paths) == 3:
+        elif len(paths) >= 2:
             grayscale_paths = []
             for p in paths:
                 try:
@@ -761,7 +870,7 @@ class MainWindow(QMainWindow):
                             self,
                             "Invalid channels",
                             f"File {p.name} is not a grayscale image (mode {img.mode}).\n"
-                            "All three files must be grayscale (8-bit L or 16-bit I;16)."
+                            "All files must be grayscale (8-bit L or 16-bit I;16)."
                         )
                         return
                     grayscale_paths.append(p)
@@ -773,23 +882,18 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Size mismatch",
-                    "All three grayscale images must have the same dimensions."
+                    "All grayscale images must have the same dimensions."
                 )
                 return
 
-            self.mode = 'three_gray'
+            self.mode = 'multi_gray'
             self.input_paths = grayscale_paths
-            self.file_label.setText(
-                f"Three grayscale channels (will be processed together as RGB):\n"
-                f"R: {grayscale_paths[0].name}\n"
-                f"G: {grayscale_paths[1].name}\n"
-                f"B: {grayscale_paths[2].name}"
-            )
         else:
             QMessageBox.warning(
                 self,
                 "Invalid selection",
-                "Please drop exactly 1 image (RGB or grayscale) or 3 grayscale images."
+                "Please drop exactly 1 image (RGB or grayscale)\n"
+                "or 2+ grayscale images."
             )
             return
 
@@ -797,6 +901,18 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.process_button.setEnabled(True)
         self.status.setText("Ready to process")
+
+        # Заполняем список файлов (существующие настройки сохраняются)
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        for p in self.input_paths:
+            item = QListWidgetItem(p.name)
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            item.setToolTip(str(p))
+            self.file_list.addItem(item)
+            self.get_settings(p)  # инициализация настройками по умолчанию
+        self.file_list.blockSignals(False)
+        self.file_list.setCurrentRow(0)
 
         self.build_preview_array()
         self.schedule_preview_update()
@@ -845,16 +961,21 @@ class MainWindow(QMainWindow):
             max_band_height = self.max_band_height.value()
             is_hrpt = self.hrpt_checkbox.isChecked()
 
-            def do_repair(img):
+            def do_repair(img, path):
+                # Индивидуальные настройки файла; при отсутствии — значения UI
+                s = self.per_image.get(path) or {
+                    'threshold': threshold, 'deviation': deviation,
+                    'max_band_height': max_band_height}
                 if is_hrpt:
-                    return ImageRepair.repair_hrpt(img, deviation_threshold=deviation,
-                                                   max_band_height=max_band_height)
-                return ImageRepair.repair(img, black_threshold=threshold)
+                    return ImageRepair.repair_hrpt(
+                        img, deviation_threshold=s['deviation'],
+                        max_band_height=s['max_band_height'])
+                return ImageRepair.repair(img, black_threshold=s['threshold'])
 
             if self.mode == 'single_rgb':
 
                 img = ImageRepair.load_image(self.input_paths[0])
-                repaired, ranges = do_repair(img)
+                repaired, ranges = do_repair(img, self.input_paths[0])
                 out_path = target_path(self.input_paths[0])
                 save_like(repaired, img, out_path)
                 all_results = [{'file': out_path.name, 'ranges': ranges}]
@@ -862,17 +983,17 @@ class MainWindow(QMainWindow):
 
             elif self.mode == 'single_gray':
                 img = ImageRepair.load_gray(self.input_paths[0])
-                repaired, ranges = do_repair(img)
+                repaired, ranges = do_repair(img, self.input_paths[0])
                 out_path = target_path(self.input_paths[0])
                 save_like(repaired, img, out_path)
                 all_results = [{'file': out_path.name, 'ranges': ranges}]
                 self.progress.setValue(90)
 
-            elif self.mode == 'three_gray':
+            elif self.mode == 'multi_gray':
                 all_results = []
                 for ch, p in enumerate(self.input_paths):
                     img = ImageRepair.load_gray(p)
-                    repaired, ranges = do_repair(img)
+                    repaired, ranges = do_repair(img, p)
                     out_path = target_path(p)
                     save_like(repaired, img, out_path)
                     if ranges:
@@ -890,7 +1011,8 @@ class MainWindow(QMainWindow):
                 for res in all_results:
                     lines.append(f"File: {res['file']}")
                     for info in res['ranges']:
-                        ch_name = 'Grayscale' if self.mode in ('single_gray',) else ['R', 'G', 'B'][info['channel']]
+                        ch_name = ('Grayscale' if self.mode in ('single_gray', 'multi_gray')
+                                   else ['R', 'G', 'B'][info['channel']])
                         lines.append(f"  Channel {ch_name}:")
                         if is_hrpt and len(info['ranges']) > 50:
                             total_rows = sum(end - start + 1 for start, end in info['ranges'])
